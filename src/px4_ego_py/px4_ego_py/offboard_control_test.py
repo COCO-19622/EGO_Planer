@@ -40,6 +40,7 @@ from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleStatus,
 from quadrotor_msgs.msg import PositionCommand
 from std_msgs.msg import String
 import math
+import fcntl
 
 
 class OffboardControl(Node):
@@ -67,9 +68,14 @@ class OffboardControl(Node):
             'fmu/out/vehicle_status',
             self.vehicle_status_callback,
             qos_profile_sub)
-        self.status_sub = self.create_subscription(
+        self.status_v1_sub = self.create_subscription(
             VehicleStatus,
             'fmu/out/vehicle_status_v1',
+            self.vehicle_status_callback,
+            qos_profile_sub)
+        self.status_v4_sub = self.create_subscription(
+            VehicleStatus,
+            'fmu/out/vehicle_status_v4',
             self.vehicle_status_callback,
             qos_profile_sub)
         self.vehicle_local_position_sub = self.create_subscription(
@@ -85,7 +91,8 @@ class OffboardControl(Node):
         self.publisher_trajectory = self.create_publisher(TrajectorySetpoint, 'fmu/in/trajectory_setpoint', qos_profile_pub)
         self.publisher_vehicle_command = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile_pub)
 
-        self.control_mode = 'm'
+        self.declare_parameter('initial_mode', 'm')
+        self.control_mode = self.get_parameter('initial_mode').value
         self.offboard_setpoint_counter = 0
         self.land_trigger_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
@@ -100,6 +107,7 @@ class OffboardControl(Node):
         self.vehicle_local_position_received = False
         self.vehicle_visual_odom_received = False
         self.planning_pos_command_received = False
+        self.last_planning_command_time = None
         self.takeoff_hover_des_set = False
         self.offboard_hover_des_set = False
         self.hover_setpoint = TrajectorySetpoint()
@@ -133,6 +141,7 @@ class OffboardControl(Node):
     def planning_pos_cmd_callback(self, msg):
         self.latest_planning_msg = msg
         self.planning_pos_command_received = True
+        self.last_planning_command_time = self.get_clock().now()
 
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
@@ -157,7 +166,7 @@ class OffboardControl(Node):
         """Switch to offboard mode."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.get_logger().info("Switching to offboard mode")
+        self.get_logger().info("Switching to offboard mode", throttle_duration_sec=2.0)
     
     def enter_position_mode(self):
         """Exit offboard mode and switch to position mode."""
@@ -210,6 +219,8 @@ class OffboardControl(Node):
         self.publisher_vehicle_command.publish(msg)
 
     def position_msg_pub(self):
+        if not (self.vehicle_local_position_received or self.vehicle_visual_odom_received):
+            return
         msg = TrajectorySetpoint()
         if (self.vehicle_local_position_received and not self.vehicle_visual_odom_received):
             if not self.takeoff_hover_des_set:
@@ -238,6 +249,8 @@ class OffboardControl(Node):
     # VehicleLocalPosition /fmu/out/vehicle_local_position_v1 for simulation
     # VehicleOdometry /fmu/in/vehicle_visual_odometry for real experiment
     def hover_cmd_pub(self):
+        if not (self.vehicle_local_position_received or self.vehicle_visual_odom_received):
+            return
         msg = TrajectorySetpoint()
         if (self.vehicle_local_position_received and not self.vehicle_visual_odom_received):
             if not self.offboard_hover_des_set:
@@ -326,8 +339,11 @@ class OffboardControl(Node):
 
     def cmdloop_callback(self):
         self.publish_offboard_control_heartbeat_signal()
+        if (self.last_planning_command_time is not None and
+                (self.get_clock().now() - self.last_planning_command_time).nanoseconds > 500_000_000):
+            self.planning_pos_command_received = False
         if self.control_mode == 'm':
-            self.get_logger().info("manual control")
+            self.get_logger().info("manual control", throttle_duration_sec=2.0)
             return
 
         if self.control_mode == 't':
@@ -338,13 +354,13 @@ class OffboardControl(Node):
                 self.arm()
             self.offboard_hover_des_set = False
             self.position_msg_pub()
-            self.get_logger().info("takeoff")
+            self.get_logger().info("takeoff", throttle_duration_sec=2.0)
             return
 
         if self.control_mode == 'p':
             self.takeoff_hover_des_set = False
             self.hover_cmd_pub()
-            self.get_logger().info("position mode")
+            self.get_logger().info("position mode", throttle_duration_sec=2.0)
             return
 
         if (self.control_mode == 'o' and not self.planning_pos_command_received):
@@ -352,7 +368,8 @@ class OffboardControl(Node):
             # self.enter_position_mode()
             self.takeoff_hover_des_set = False
             self.hover_cmd_pub()
-            self.get_logger().info("No command in offboard, return to position mode")
+            self.get_logger().info("No command in offboard, holding position",
+                                   throttle_duration_sec=2.0)
             return
 
         if (self.control_mode == 'o' and self.planning_pos_command_received):
@@ -366,13 +383,14 @@ class OffboardControl(Node):
                         self.offboard_hover_des_set = False
                         self.takeoff_hover_des_set = False
                         self.ego_cmd_pub()
-                        self.get_logger().info("offboard velocity")
+                        self.get_logger().info("offboard trajectory", throttle_duration_sec=2.0)
                         return
                     else:
                         self.in_position_hold = True
                         # self.enter_position_mode()
                         self.hover_cmd_pub()
-                        self.get_logger().info("hhhhh")
+                        self.get_logger().info("No valid trajectory; holding position",
+                                               throttle_duration_sec=2.0)
                         return
         
         if self.control_mode == 'l':
@@ -385,6 +403,13 @@ class OffboardControl(Node):
 
 
 def main(args=None):
+    # PX4 must have exactly one offboard setpoint source from this controller.
+    lock = open('/tmp/px4_ego_offboard_control.lock', 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('offboard_control_test is already running; refusing a second controller')
+        return
     rclpy.init(args=args)
 
     offboard_control = OffboardControl()

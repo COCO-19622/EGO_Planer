@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             "offboard_control_test = px4_ego_py.offboard_control_test:main",
+            "px4_ego_bridge = px4_ego_py.px4_ego_bridge:main",
         ],
     },
 )
